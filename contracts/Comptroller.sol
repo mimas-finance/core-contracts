@@ -7,6 +7,7 @@ import "./ComptrollerInterface.sol";
 import "./ComptrollerStorage.sol";
 import "./Unitroller.sol";
 import "./Governance/Mimas.sol";
+import "./EIP20Interface.sol";
 
 /**
  * @title Mimas' Comptroller Contract
@@ -43,8 +44,11 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     /// @notice Emitted when an action is paused on a market
     event ActionPaused(MmToken mmToken, string action, bool pauseState);
 
-    /// @notice Emitted when a new MIMAS or CRO speed is calculated for a market
-    event SpeedUpdated(uint8 tokenType, MmToken indexed mmToken, uint newSpeed);
+    /// @notice Emitted when a new borrow-side MIMAS or CRO speed is calculated for a market
+    event BorrowSpeedUpdated(uint8 tokenType, MmToken indexed mmToken, uint newSpeed);
+
+    /// @notice Emitted when a new supply-side MIMAS or CRO speed is calculated for a market
+    event SupplySpeedUpdated(uint8 tokenType, MmToken indexed mmToken, uint newSpeed);
 
     /// @notice Emitted when a new MIMAS speed is set for a contributor
     event ContributorMimasSpeedUpdated(address indexed contributor, uint newSpeed);
@@ -925,9 +929,39 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
         _addMarketInternal(address(mmToken));
 
+        // Initialize all markets for all reward types
+        for (uint8 rewardType = 0; rewardType < maxRewardTokens; rewardType++) {
+            _initializeMarket(rewardType, address(mmToken));
+        }
+
         emit MarketListed(mmToken);
 
         return uint(Error.NO_ERROR);
+    }
+
+    function _initializeMarket(uint8 rewardType, address mmToken) internal {
+        uint32 blockTimestamp = safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits");
+
+        RewardMarketState storage supplyState = rewardSupplyState[rewardType][mmToken];
+        RewardMarketState storage borrowState = rewardBorrowState[rewardType][mmToken];
+
+        /*
+         * Update market state indices
+         */
+        if (supplyState.index == 0) {
+            // Initialize supply state index with default value
+            supplyState.index = initialIndexConstant;
+        }
+
+        if (borrowState.index == 0) {
+            // Initialize borrow state index with default value
+            borrowState.index = initialIndexConstant;
+        }
+
+        /*
+         * Update market state block numbers
+         */
+         supplyState.timestamp = borrowState.timestamp = blockTimestamp;
     }
 
     function _addMarketInternal(address mmToken) internal {
@@ -1051,100 +1085,90 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
     /**
      * @notice Set MIMAS/CRO speed for a single market
-     * @param rewardType  0: MIMAS, 1: CRO
-     * @param mmToken The market whose MIMAS speed to update
-     * @param newSpeed New MIMAS or CRO speed for market
+     * @param rewardType  0: MIMAS, 1: CRO, 2: other, ...
+     * @param mmToken The market whose MIMAS / CRO speed to update
+     * @param supplySpeed New supply-side MIMAS / CRO speed for market
+     * @param borrowSpeed New borrow-side MIMAS / CRO speed for market
      */
-    function setRewardSpeedInternal(uint8 rewardType, MmToken mmToken, uint newSpeed) internal {
-        uint currentRewardSpeed = rewardSpeeds[rewardType][address(mmToken)];
-        if (currentRewardSpeed != 0) {
-            // note that MIMAS speed could be set to 0 to halt liquidity rewards for a market
-            Exp memory borrowIndex = Exp({mantissa: mmToken.borrowIndex()});
-            updateRewardSupplyIndex(rewardType,address(mmToken));
-            updateRewardBorrowIndex(rewardType,address(mmToken), borrowIndex);
-        } else if (newSpeed != 0) {
-            // Add the MIMAS market
-            Market storage market = markets[address(mmToken)];
-            require(market.isListed == true, "Mimas market is not listed");
+    function setRewardSpeedInternal(uint8 rewardType, MmToken mmToken, uint supplySpeed, uint borrowSpeed) internal {
+        Market storage market = markets[address(mmToken)];
+        require(market.isListed, "Mimas market is not listed");
 
-            if (rewardSupplyState[rewardType][address(mmToken)].index == 0 && rewardSupplyState[rewardType][address(mmToken)].timestamp == 0) {
-                rewardSupplyState[rewardType][address(mmToken)] = RewardMarketState({
-                    index: initialIndexConstant,
-                    timestamp: safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits")
-                });
-            }
+        if (rewardSupplySpeeds[rewardType][address(mmToken)] != supplySpeed) {
+            // Supply speed updated so let's update supply state to ensure that
+            //  1. Reward accrued properly for the old speed, and
+            //  2. Reward accrued at the new speed starts after this block.
+            updateRewardSupplyIndex(rewardType, address(mmToken));
 
-            if (rewardBorrowState[rewardType][address(mmToken)].index == 0 && rewardBorrowState[rewardType][address(mmToken)].timestamp == 0) {
-                rewardBorrowState[rewardType][address(mmToken)] = RewardMarketState({
-                    index: initialIndexConstant,
-                    timestamp: safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits")
-                });
-            }
+            // Update speed and emit event
+            rewardSupplySpeeds[rewardType][address(mmToken)] = supplySpeed;
+            emit SupplySpeedUpdated(rewardType, mmToken, supplySpeed);
         }
 
-        if (currentRewardSpeed != newSpeed) {
-            rewardSpeeds[rewardType][address(mmToken)] = newSpeed;
-            emit SpeedUpdated(rewardType, mmToken, newSpeed);
+        if (rewardBorrowSpeeds[rewardType][address(mmToken)] != borrowSpeed) {
+            // Borrow speed updated so let's update borrow state to ensure that
+            //  1. Reward accrued properly for the old speed, and
+            //  2. Reward accrued at the new speed starts after this block.
+            Exp memory borrowIndex = Exp({mantissa: mmToken.borrowIndex()});
+            updateRewardBorrowIndex(rewardType, address(mmToken), borrowIndex);
+
+            // Update speed and emit event
+            rewardBorrowSpeeds[rewardType][address(mmToken)] = borrowSpeed;
+            emit BorrowSpeedUpdated(rewardType, mmToken, borrowSpeed);
         }
     }
 
     /**
      * @notice Accrue MIMAS to the market by updating the supply index
-     * @param rewardType  0: MIMAS, 1: CRO
+     * @param rewardType  0: MIMAS, 1: CRO, 2: other, ...
      * @param mmToken The market whose supply index to update
      */
     function updateRewardSupplyIndex(uint8 rewardType, address mmToken) internal {
-        require(rewardType <= 1, "rewardType is invalid"); 
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
         RewardMarketState storage supplyState = rewardSupplyState[rewardType][mmToken];
-        uint supplySpeed = rewardSpeeds[rewardType][mmToken];
-        uint blockTimestamp = getBlockTimestamp();
-        uint deltaTimestamps = sub_(blockTimestamp, uint(supplyState.timestamp));
+        uint supplySpeed = rewardSupplySpeeds[rewardType][mmToken];
+        uint32 blockTimestamp = safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits");
+        uint deltaTimestamps = sub_(uint(blockTimestamp), uint(supplyState.timestamp));
         if (deltaTimestamps > 0 && supplySpeed > 0) {
             uint supplyTokens = MmToken(mmToken).totalSupply();
             uint mimasAccrued = mul_(deltaTimestamps, supplySpeed);
             Double memory ratio = supplyTokens > 0 ? fraction(mimasAccrued, supplyTokens) : Double({mantissa: 0});
-            Double memory index = add_(Double({mantissa: supplyState.index}), ratio);
-            rewardSupplyState[rewardType][mmToken] = RewardMarketState({
-                index: safe224(index.mantissa, "new index exceeds 224 bits"),
-                timestamp: safe32(blockTimestamp, "block timestamp exceeds 32 bits")
-            });
+            supplyState.index = safe224(add_(Double({mantissa: supplyState.index}), ratio).mantissa, "new index exceeds 224 bits");
+            supplyState.timestamp = blockTimestamp;
         } else if (deltaTimestamps > 0) {
-            supplyState.timestamp = safe32(blockTimestamp, "block timestamp exceeds 32 bits");
+            supplyState.timestamp = blockTimestamp;
         }
     }
 
     /**
      * @notice Accrue MIMAS to the market by updating the borrow index
-     * @param rewardType  0: MIMAS, 1: CRO
+     * @param rewardType  0: MIMAS, 1: CRO, 2: other, ...
      * @param mmToken The market whose borrow index to update
      */
     function updateRewardBorrowIndex(uint8 rewardType, address mmToken, Exp memory marketBorrowIndex) internal {
-        require(rewardType <= 1, "rewardType is invalid"); 
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
         RewardMarketState storage borrowState = rewardBorrowState[rewardType][mmToken];
-        uint borrowSpeed = rewardSpeeds[rewardType][mmToken];
-        uint blockTimestamp = getBlockTimestamp();
-        uint deltaTimestamps = sub_(blockTimestamp, uint(borrowState.timestamp));
+        uint borrowSpeed = rewardBorrowSpeeds[rewardType][mmToken];
+        uint32 blockTimestamp = safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits");
+        uint deltaTimestamps = sub_(uint(blockTimestamp), uint(borrowState.timestamp));
         if (deltaTimestamps > 0 && borrowSpeed > 0) {
             uint borrowAmount = div_(MmToken(mmToken).totalBorrows(), marketBorrowIndex);
             uint mimasAccrued = mul_(deltaTimestamps, borrowSpeed);
             Double memory ratio = borrowAmount > 0 ? fraction(mimasAccrued, borrowAmount) : Double({mantissa: 0});
-            Double memory index = add_(Double({mantissa: borrowState.index}), ratio);
-            rewardBorrowState[rewardType][mmToken] = RewardMarketState({
-                index: safe224(index.mantissa, "new index exceeds 224 bits"),
-                timestamp: safe32(blockTimestamp, "block timestamp exceeds 32 bits")
-            });
+            borrowState.index = safe224(add_(Double({mantissa: borrowState.index}), ratio).mantissa, "new index exceeds 224 bits");
+            borrowState.timestamp = blockTimestamp;
         } else if (deltaTimestamps > 0) {
-            borrowState.timestamp = safe32(blockTimestamp, "block timestamp exceeds 32 bits");
+            borrowState.timestamp = blockTimestamp;
         }
     }
 
     /**
      * @notice Refactored function to calc and rewards accounts supplier rewards
      * @param mmToken The market to verify the mint against
-     * @param account The acount to whom MIMAS or CRO is rewarded
+     * @param account The acount to whom reward tokens (MIMAS, CRO, others) are rewarded
      */
     function updateAndDistributeSupplierRewardsForToken(address mmToken, address account) internal {
-        for (uint8 rewardType = 0; rewardType <= 1; rewardType++) {
+        for (uint8 rewardType = 0; rewardType < maxRewardTokens; rewardType++) {
             updateRewardSupplyIndex(rewardType, mmToken);
             distributeSupplierReward(rewardType, mmToken, account);
         }
@@ -1152,27 +1176,42 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
     /**
      * @notice Calculate MIMAS/CRO accrued by a supplier and possibly transfer it to them
-     * @param rewardType  0: MIMAS, 1: CRO
+     * @param rewardType  0: MIMAS, 1: CRO, 2: other, ...
      * @param mmToken The market in which the supplier is interacting
      * @param supplier The address of the supplier to distribute MIMAS to
      */
     function distributeSupplierReward(uint8 rewardType, address mmToken, address supplier) internal {
-        require(rewardType <= 1, "rewardType is invalid"); 
-        RewardMarketState storage supplyState = rewardSupplyState[rewardType][mmToken];
-        Double memory supplyIndex = Double({mantissa: supplyState.index});
-        Double memory supplierIndex = Double({mantissa: rewardSupplierIndex[rewardType][mmToken][supplier]});
-        rewardSupplierIndex[rewardType][mmToken][supplier] = supplyIndex.mantissa;
+        // TODO: Don't distribute supplier rewards if the user is not in the supplier market.
+        // This check should be as gas efficient as possible as distributeSupplierComp is called in many places.
+        // - We really don't want to call an external contract as that's quite expensive.
 
-        if (supplierIndex.mantissa == 0 && supplyIndex.mantissa > 0) {
-            supplierIndex.mantissa = initialIndexConstant;
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
+        RewardMarketState storage supplyState = rewardSupplyState[rewardType][mmToken];
+        uint supplyIndex = supplyState.index;
+        uint supplierIndex = rewardSupplierIndex[rewardType][mmToken][supplier];
+
+        // Update supplier's index to the current index since we are distributing accrued rewards
+        rewardSupplierIndex[rewardType][mmToken][supplier] = supplyIndex;
+
+        if (supplierIndex == 0 && supplyIndex >= initialIndexConstant) {
+            // Covers the case where users supplied tokens before the market's supply state index was set.
+            // Rewards the user with rewards accrued from the start of when supplier rewards were first
+            // set for the market.
+            supplierIndex = initialIndexConstant;
         }
 
-        Double memory deltaIndex = sub_(supplyIndex, supplierIndex);
+        // Calculate change in the cumulative sum of the rewards per mmToken accrued
+        Double memory deltaIndex = Double({mantissa: sub_(supplyIndex, supplierIndex)});
+
         uint supplierTokens = MmToken(mmToken).balanceOf(supplier);
+
+        // Calculate rewards accrued: mmTokenAmount * accruedPerMmToken
         uint supplierDelta = mul_(supplierTokens, deltaIndex);
+
         uint supplierAccrued = add_(rewardAccrued[rewardType][supplier], supplierDelta);
+
         rewardAccrued[rewardType][supplier] = supplierAccrued;
-        emit DistributedSupplierReward(rewardType, MmToken(mmToken), supplier, supplierDelta, supplyIndex.mantissa);
+        emit DistributedSupplierReward(rewardType, MmToken(mmToken), supplier, supplierDelta, supplyIndex);
     }
 
    /**
@@ -1181,7 +1220,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param borrower Borrower to be rewarded
      */
     function updateAndDistributeBorrowerRewardsForToken(address mmToken, address borrower, Exp memory marketBorrowIndex) internal {
-        for (uint8 rewardType = 0; rewardType <= 1; rewardType++) {
+        for (uint8 rewardType = 0; rewardType < maxRewardTokens; rewardType++) {
             updateRewardBorrowIndex(rewardType, mmToken, marketBorrowIndex);
             distributeBorrowerReward(rewardType, mmToken, borrower, marketBorrowIndex);
         }
@@ -1190,29 +1229,46 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     /**
      * @notice Calculate MIMAS accrued by a borrower and possibly transfer it to them
      * @dev Borrowers will not begin to accrue until after the first interaction with the protocol.
-     * @param rewardType  0: MIMAS, 1: CRO
+     * @param rewardType  0: MIMAS, 1: CRO, 2: other, ...
      * @param mmToken The market in which the borrower is interacting
      * @param borrower The address of the borrower to distribute MIMAS to
      */
     function distributeBorrowerReward(uint8 rewardType, address mmToken, address borrower, Exp memory marketBorrowIndex) internal {
-        require(rewardType <= 1, "rewardType is invalid"); 
-        RewardMarketState storage borrowState = rewardBorrowState [rewardType][mmToken];
-        Double memory borrowIndex = Double({mantissa: borrowState.index});
-        Double memory borrowerIndex = Double({mantissa: rewardBorrowerIndex[rewardType][mmToken][borrower]});
-        rewardBorrowerIndex[rewardType][mmToken][borrower] = borrowIndex.mantissa;
+        // TODO: Don't distribute supplier rewards if the user is not in the borrower market.
+        // This check should be as gas efficient as possible as distributeBorrowerReward is called in many places.
+        // - We really don't want to call an external contract as that's quite expensive.
 
-        if (borrowerIndex.mantissa > 0) {
-            Double memory deltaIndex = sub_(borrowIndex, borrowerIndex);
-            uint borrowerAmount = div_(MmToken(mmToken).borrowBalanceStored(borrower), marketBorrowIndex);
-            uint borrowerDelta = mul_(borrowerAmount, deltaIndex);
-            uint borrowerAccrued = add_(rewardAccrued[rewardType][borrower], borrowerDelta);
-            rewardAccrued[rewardType][borrower] = borrowerAccrued;
-            emit DistributedBorrowerReward(rewardType, MmToken(mmToken), borrower, borrowerDelta, borrowIndex.mantissa);
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
+        RewardMarketState storage borrowState = rewardBorrowState[rewardType][mmToken];
+        uint borrowIndex = borrowState.index;
+        uint borrowerIndex = rewardBorrowerIndex[rewardType][mmToken][borrower];
+
+        // Update borrowers's index to the current index since we are distributing accrued rewards.
+        rewardBorrowerIndex[rewardType][mmToken][borrower] = borrowIndex;
+
+        if (borrowerIndex == 0 && borrowIndex >= initialIndexConstant) {
+            // Covers the case where users borrowed tokens before the market's borrow state index was set.
+            // Rewards the user with rewards accrued from the start of when borrower rewards were first
+            // set for the market.
+            borrowerIndex = initialIndexConstant;
         }
+
+        // Calculate change in the cumulative sum of the COMP per borrowed unit accrued
+        Double memory deltaIndex = Double({mantissa: sub_(borrowIndex, borrowerIndex)});
+
+        uint borrowerAmount = div_(MmToken(mmToken).borrowBalanceStored(borrower), marketBorrowIndex);
+
+        // Calculate rewards accrued: mmTokenAmount * accruedPerBorrowedUnit
+        uint borrowerDelta = mul_(borrowerAmount, deltaIndex);
+
+        uint borrowerAccrued = add_(rewardAccrued[rewardType][borrower], borrowerDelta);
+        rewardAccrued[rewardType][borrower] = borrowerAccrued;
+
+        emit DistributedBorrowerReward(rewardType, MmToken(mmToken), borrower, borrowerDelta, borrowIndex);
     }
 
     /**
-     * @notice Claim all the mimas accrued by holder in all markets
+     * @notice Claim all the MIMAS/CRO/other accrued by holder in all markets
      * @param holder The address to claim MIMAS for
      */
     function claimReward(uint8 rewardType, address payable holder) public {
@@ -1221,7 +1277,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
     /**
      * @notice Claim all the mimas accrued by holder in the specified markets
-     * @param holder The address to claim MIMAS for
+     * @param holder The address to claim MIMAS/CRO/other for
      * @param mmTokens The list of markets to claim MIMAS in
      */
     function claimReward(uint8 rewardType, address payable holder, MmToken[] memory mmTokens) public {
@@ -1232,14 +1288,14 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
     /**
      * @notice Claim all MIMAS or CRO accrued by the holders
-     * @param rewardType  0 means MIMAS   1 means CRO
+     * @param rewardType  0: MIMAS, 1: CRO, 2: other, ...
      * @param holders The addresses to claim CRO for
      * @param mmTokens The list of markets to claim CRO in
      * @param borrowers Whether or not to claim CRO earned by borrowing
      * @param suppliers Whether or not to claim CRO earned by supplying
      */
     function claimReward(uint8 rewardType, address payable[] memory holders, MmToken[] memory mmTokens, bool borrowers, bool suppliers) public payable {
-        require(rewardType <= 1, "rewardType is invalid");
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
         for (uint i = 0; i < mmTokens.length; i++) {
             MmToken mmToken = mmTokens[i];
             require(markets[address(mmToken)].isListed, "market must be listed");
@@ -1263,23 +1319,29 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
     /**
      * @notice Transfer MIMAS/CRO to the user
-     * @dev Note: If there is not enough MIMAS/CRO, we do not perform the transfer all.
+     * @dev Note: If there is not enough MIMAS/CRO/other, we do not perform the transfer all.
      * @param user The address of the user to transfer CRO to
      * @param amount The amount of CRO to (possibly) transfer
      * @return The amount of CRO which was NOT transferred to the user
      */
-    function grantRewardInternal(uint rewardType, address payable user, uint amount) internal returns (uint) {
-        if (rewardType == 0) {
-            Mimas mimas = Mimas(mimasAddress);
-            uint mimasRemaining = mimas.balanceOf(address(this));
-            if (amount > 0 && amount <= mimasRemaining) {
-                mimas.transfer(user, amount);
+    function grantRewardInternal(uint8 rewardType, address payable user, uint amount) internal returns (uint) {
+        require (rewardType < maxRewardTokens, "rewardType is invalid");
+        if (rewardType == nativeTokenRewardType) {
+            // Native token rewards.
+            uint nativeRemaining = address(this).balance;
+            if (amount > 0 && amount <= nativeRemaining) {
+                user.transfer(amount);
                 return 0;
             }
-        } else if (rewardType == 1) {
-            uint oneRemaining = address(this).balance;
-            if (amount > 0 && amount <= oneRemaining) {
-                user.transfer(amount);
+        } else if (rewardTokenAddress[rewardType] != address(0)){
+            // Other ERC20 reward tokens, including the protocol token (MIMAS).
+            //
+            // If the reward token is not set, then don't grant rewards, but it would
+            // still keep accruing.
+            EIP20Interface erc20 = EIP20Interface(rewardTokenAddress[rewardType]);
+            uint erc20Remaining = erc20.balanceOf(address(this));
+            if (amount > 0 && amount <= erc20Remaining) {
+                erc20.transfer(user, amount);
                 return 0;
             }
         }
@@ -1296,21 +1358,22 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      */
     function _grantMimas(address payable recipient, uint amount) public {
         require(adminOrInitializing(), "only admin can grant mimas");
-        uint amountLeft = grantRewardInternal(0, recipient, amount);
+        uint amountLeft = grantRewardInternal(protocolTokenRewardType, recipient, amount);
         require(amountLeft == 0, "insufficient mimas for grant");
         emit MimasGranted(recipient, amount);
     }
 
     /**
      * @notice Set reward speed for a single market
-     * @param rewardType 0 = MIMAS, 1 = CRO
+     * @param rewardType 0 = MIMAS, 1 = CRO, 2: other, ...
      * @param mmToken The market whose reward speed to update
-     * @param rewardSpeed New reward speed for market
+     * @param supplySpeed New supply-side reward speed for the corresponding market.
+     * @param borrowSpeed New borrow-side reward speed for the corresponding market.
      */
-    function _setRewardSpeed(uint8 rewardType, MmToken mmToken, uint rewardSpeed) public {
-        require(rewardType <= 1, "rewardType is invalid"); 
+    function _setRewardSpeed(uint8 rewardType, MmToken mmToken, uint supplySpeed, uint borrowSpeed) public {
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
         require(adminOrInitializing(), "only admin can set reward speed");
-        setRewardSpeedInternal(rewardType, mmToken, rewardSpeed);
+        setRewardSpeedInternal(rewardType, mmToken, supplySpeed, borrowSpeed);
     }
 
     /**
@@ -1327,11 +1390,21 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     }
 
     /**
-     * @notice Set the MIMAS token address
+     * @notice Set the ERC20 reward tokens in addition to the native token (CRO).
      */
-    function setMimasAddress(address newMimasAddress) public {
+    function setRewardTokenAddress(uint8 rewardType, address tokenAddress) public {
         require(msg.sender == admin);
-        mimasAddress = newMimasAddress;
+        require(rewardType < maxRewardTokens, "rewardType is invalid");
+        require(rewardType != nativeTokenRewardType, "native token should not be set");
+
+        rewardTokenAddress[rewardType] = tokenAddress;
+    }
+
+    /**
+     * @notice Returns the address of the protocol token (MIMAS).
+     */
+    function mimasAddress() public view returns (address) {
+        return rewardTokenAddress[protocolTokenRewardType];
     }
 
     /**

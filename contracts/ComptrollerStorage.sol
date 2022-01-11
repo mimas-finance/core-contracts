@@ -110,8 +110,11 @@ contract ComptrollerVXStorage is UnitrollerAdminStorage {
     /// @notice The rate at which the flywheel distributes reward, per timestamp
     mapping(uint8 => uint) rewardRate;
 
-    /// @notice The portion of reward rate that each market currently receives
-    mapping(uint8 => mapping(address => uint)) public rewardSpeeds;
+    /// @notice The rate at which reward is distributed to the corresponding borrow market (per second)
+    mapping(uint8 => mapping(address => uint)) public rewardBorrowSpeeds;
+
+    /// @notice The rate at which reward is distributed to the corresponding supply market (per second)
+    mapping(uint8 => mapping(address => uint)) public rewardSupplySpeeds;
 
     /// @notice The MIMAS/CRO market supply state for each market
     mapping(uint8 => mapping(address => RewardMarketState)) public rewardSupplyState;
@@ -128,6 +131,15 @@ contract ComptrollerVXStorage is UnitrollerAdminStorage {
     /// @notice The MIMAS/CRO accrued but not yet transferred to each user
     mapping(uint8 => mapping(address => uint)) public rewardAccrued;
 
-    /// @notice MIMAS token contract address
-    address public mimasAddress;
+    /// @notice ERC20 tokens to be distributed as rewards, including the protocol token (MIMAS).
+    mapping(uint8 => address) public rewardTokenAddress;
+
+    /// @notice The maximun number of reward tokens.
+    uint8 constant maxRewardTokens = 4;
+
+    /// @notice Protocol token (MIMAS) reward type.
+    uint8 constant protocolTokenRewardType = 0;
+
+    /// @notice Native token (CRO) reward type.
+    uint8 constant nativeTokenRewardType = 1;
 }
